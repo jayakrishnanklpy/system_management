@@ -196,3 +196,17 @@ echo "New database credentials (also stored in ${PUBLIC_HTML}/wp-config.php):"
 echo "  DB name: ${DB_NAME}"
 echo "  DB user: ${DB_USER}"
 echo "  DB pass: ${DB_PASS}"
+
+# ---------- Temp URL (run from the destination docroot) ----------
+echo
+echo ">>> Generating temp URL for ${DOMAIN}..."
+(
+    cd "$PUBLIC_HTML" || exit 1
+    DEST_IP="$(curl -s --max-time 10 ifconfig.me)"
+    if [[ ! "$DEST_IP" =~ ^[0-9A-Fa-f.:]+$ ]]; then
+        echo "WARNING: could not detect this server's public IP; skipping temp URL." >&2
+        exit 1
+    fi
+    curl -fsS --max-time 30 "https://tempurl.cc?domain=${DOMAIN}&ip=${DEST_IP}"
+    echo
+) || echo "WARNING: temp URL request failed (the migration itself completed)." >&2
