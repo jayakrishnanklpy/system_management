@@ -37,7 +37,6 @@ PUBLIC_HTML="${CPHOME}/public_html"
 SRC_PATH="/home/nginx/domains/${DOMAIN}/public"
 
 [[ -d "$PUBLIC_HTML" ]]            || die "${PUBLIC_HTML} not found (is ${CPUSER} the right account?)."
-[[ -f "$PUBLIC_HTML/wp-config.php" ]] || die "${PUBLIC_HTML}/wp-config.php not found; the destination needs an existing wp-config.php."
 
 echo
 echo "Source:       root@${SRC_IP}:${SSH_PORT}  (${SRC_PATH})"
@@ -84,6 +83,45 @@ DUMP_STARTED=1
 ssh "${SSH_OPTS[@]}" "root@${SRC_IP}" \
     "cd '${SRC_PATH}' && umask 077 && wp db export ${DUMP} --default-character-set=utf8mb4 --max_allowed_packet=1G --single-transaction ${WPFLAGS}" \
     || die "database export failed on the source."
+
+# ---------- Step 1b: random DB + user, fresh WordPress core and wp-config.php ----------
+echo
+echo ">>> Creating random database/user and a fresh WordPress in ${PUBLIC_HTML}..."
+
+rand_str() {   # rand_str <length> <charset regex for tr>
+    local raw
+    raw="$(openssl rand -base64 96 | tr -dc "$2")"
+    echo "${raw:0:$1}"
+}
+
+# cPanel prefixes DB and user names with the account name (usually 8 chars + "_")
+DB_PREFIX="$(uapi --user="$CPUSER" Mysql get_restrictions 2>/dev/null | awk '/^ *prefix:/{print $2; exit}' | tr -d "'\"")"
+[[ -n "$DB_PREFIX" ]] || DB_PREFIX="${CPUSER:0:8}_"
+
+DB_NAME="${DB_PREFIX}$(rand_str 8 'a-z0-9')"
+DB_USER="${DB_PREFIX}$(rand_str 6 'a-z0-9')"
+DB_PASS="$(rand_str 24 'A-Za-z0-9')"
+[[ ${#DB_PASS} -eq 24 && "$DB_NAME" != "$DB_PREFIX" && "$DB_USER" != "$DB_PREFIX" ]] || die "could not generate random DB credentials."
+
+uapi_call() {   # uapi_call <Mysql function> [key=value ...]
+    local out
+    out="$(uapi --user="$CPUSER" Mysql "$@" 2>&1)"
+    if ! grep -qE '^ *status: 1' <<<"$out"; then
+        echo "$out" >&2
+        die "uapi Mysql $1 failed."
+    fi
+}
+
+uapi_call create_database name="$DB_NAME"
+uapi_call create_user name="$DB_USER" password="$DB_PASS"
+uapi_call set_privileges_on_database user="$DB_USER" database="$DB_NAME" privileges="ALL PRIVILEGES"
+
+rm -f "${PUBLIC_HTML}/wp-config.php"
+wp core download --path="$PUBLIC_HTML" --force --skip-content --allow-root \
+    || die "wp core download failed."
+wp config create --path="$PUBLIC_HTML" --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASS" \
+    --dbhost=localhost --force ${WPFLAGS} \
+    || die "wp config create failed."
 
 # ---------- Step 2: rsync files as root ----------
 cd "$CPHOME" || die "cannot cd to ${CPHOME}."
@@ -144,3 +182,8 @@ su -s /bin/bash -l "$CPUSER" -c \
 
 echo
 echo "Migration of ${DOMAIN} completed successfully."
+echo
+echo "New database credentials (also stored in ${PUBLIC_HTML}/wp-config.php):"
+echo "  DB name: ${DB_NAME}"
+echo "  DB user: ${DB_USER}"
+echo "  DB pass: ${DB_PASS}"
