@@ -33,15 +33,24 @@ read -rp "cPanel username on this server: " CPUSER
 id "$CPUSER" &>/dev/null             || die "user '$CPUSER' does not exist on this server."
 
 CPHOME="$(getent passwd "$CPUSER" | cut -d: -f6)"
-PUBLIC_HTML="${CPHOME}/public_html"
+read -rp "Is ${DOMAIN} the primary domain of ${CPUSER}? [Y/n]: " PRIMARY_ANSWER
+if [[ "$PRIMARY_ANSWER" =~ ^[Nn]$ ]]; then
+    IS_PRIMARY=0
+    DOMAIN_TYPE="additional domain"
+    PUBLIC_HTML="${CPHOME}/${DOMAIN}"      # document root of the additional domain
+else
+    IS_PRIMARY=1
+    DOMAIN_TYPE="primary domain"
+    PUBLIC_HTML="${CPHOME}/public_html"
+fi
 SRC_PATH="/home/nginx/domains/${DOMAIN}/public"
 
-[[ -d "$PUBLIC_HTML" ]]            || die "${PUBLIC_HTML} not found (is ${CPUSER} the right account?)."
+[[ -d "$PUBLIC_HTML" ]]            || die "${PUBLIC_HTML} not found (is ${CPUSER} the right account, and is ${DOMAIN} set up in cPanel?)."
 
 echo
 echo "Source:       root@${SRC_IP}:${SSH_PORT}  (${SRC_PATH})"
 echo "Destination:  ${CPUSER} (${PUBLIC_HTML})"
-echo "Domain:       ${DOMAIN} (primary domain)"
+echo "Domain:       ${DOMAIN} (${DOMAIN_TYPE})"
 echo
 echo "WARNING: this will DELETE extra files and RESET the database for ${CPUSER} on this server."
 read -rp "Continue? [y/N]: " CONFIRM
@@ -127,7 +136,7 @@ wp config create --path="$PUBLIC_HTML" --dbname="$DB_NAME" --dbuser="$DB_USER" -
 cd "$CPHOME" || die "cannot cd to ${CPHOME}."
 
 # Primary domain: symlink public_html to the domain name
-if [[ ! -e "$DOMAIN" ]]; then
+if [[ $IS_PRIMARY -eq 1 && ! -e "$DOMAIN" ]]; then
     ln -s public_html "$DOMAIN" && chown -h "${CPUSER}:${CPUSER}" "$DOMAIN" || die "could not create symlink."
 fi
 
