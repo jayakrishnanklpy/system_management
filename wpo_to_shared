@@ -1,0 +1,146 @@
+#!/bin/bash
+#
+# wp_migrate.sh - Run on the DESTINATION (cPanel) server as root.
+#
+# Migrates a WordPress site (primary domain of a cPanel account) from a SOURCE
+# server, using root's SSH key on this machine:
+#   1. exports the DB on the source (bigscoots.sql, in the site's public dir)
+#   2. rsyncs the files over (excluding wp-config.php) as root
+#   3. copies the source table_prefix into the destination wp-config.php
+#   4. fixes ownership (contents -> user:user, public_html keeps its own owner)
+#   5. resets + imports the DB as the cPanel user
+#   6. deletes bigscoots.sql from both source and destination
+#
+
+set -uo pipefail
+
+SSH_PORT="${SSH_PORT:-2222}"   # source server SSH port (override: SSH_PORT=22 ./wp_migrate.sh)
+DUMP="bigscoots.sql"
+WPFLAGS="--allow-root --skip-plugins --skip-themes"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "run this script as root."
+
+# ---------- Prompts ----------
+read -rp "Source server IP: " SRC_IP
+read -rp "Domain name: " DOMAIN
+read -rp "cPanel username on this server: " CPUSER
+
+[[ -n "$SRC_IP" && -n "$DOMAIN" && -n "$CPUSER" ]] || die "source IP, domain and cPanel username are all required."
+[[ "$SRC_IP" =~ ^[A-Za-z0-9.:-]+$ ]] || die "source IP looks invalid."
+[[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]]  || die "domain looks invalid."
+id "$CPUSER" &>/dev/null             || die "user '$CPUSER' does not exist on this server."
+
+CPHOME="$(getent passwd "$CPUSER" | cut -d: -f6)"
+PUBLIC_HTML="${CPHOME}/public_html"
+SRC_PATH="/home/nginx/domains/${DOMAIN}/public"
+
+[[ -d "$PUBLIC_HTML" ]]            || die "${PUBLIC_HTML} not found (is ${CPUSER} the right account?)."
+[[ -f "$PUBLIC_HTML/wp-config.php" ]] || die "${PUBLIC_HTML}/wp-config.php not found; the destination needs an existing wp-config.php."
+
+echo
+echo "Source:       root@${SRC_IP}:${SSH_PORT}  (${SRC_PATH})"
+echo "Destination:  ${CPUSER} (${PUBLIC_HTML})"
+echo "Domain:       ${DOMAIN} (primary domain)"
+echo
+echo "WARNING: this will DELETE extra files and RESET the database for ${CPUSER} on this server."
+read -rp "Continue? [y/N]: " CONFIRM
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+
+SSH_OPTS=(-T -p "$SSH_PORT")
+
+# Always remove the dump from both servers when we exit (success or failure)
+DUMP_STARTED=0
+cleanup() {
+    if [[ $DUMP_STARTED -eq 1 ]]; then
+        echo ">>> Cleaning up ${DUMP} on source and destination..."
+        ssh "${SSH_OPTS[@]}" "root@${SRC_IP}" "rm -f '${SRC_PATH}/${DUMP}'" || \
+            echo "WARNING: could not remove ${SRC_PATH}/${DUMP} on the source - delete it manually." >&2
+        rm -f "${PUBLIC_HTML}/${DUMP}"
+    fi
+}
+trap cleanup EXIT
+
+# ---------- Step 1: read table prefix + export DB on the source ----------
+echo
+echo ">>> Reading table prefix from source..."
+PREFIX_ERR="$(mktemp)"
+TABLE_PREFIX="$(ssh "${SSH_OPTS[@]}" "root@${SRC_IP}" \
+    "cd '${SRC_PATH}' && wp config get table_prefix ${WPFLAGS}" 2>"$PREFIX_ERR" | tr -d '\r\n')"
+if [[ ! "$TABLE_PREFIX" =~ ^[A-Za-z0-9_]+$ ]]; then
+    echo "--- error output from the source ---" >&2
+    cat "$PREFIX_ERR" >&2
+    echo "------------------------------------" >&2
+    rm -f "$PREFIX_ERR"
+    die "could not read a valid table_prefix from the source (got: '${TABLE_PREFIX}')."
+fi
+rm -f "$PREFIX_ERR"
+echo "Table prefix: ${TABLE_PREFIX}"
+
+echo
+echo ">>> Exporting database on source..."
+DUMP_STARTED=1
+ssh "${SSH_OPTS[@]}" "root@${SRC_IP}" \
+    "cd '${SRC_PATH}' && umask 077 && wp db export ${DUMP} --default-character-set=utf8mb4 --max_allowed_packet=1G --single-transaction ${WPFLAGS}" \
+    || die "database export failed on the source."
+
+# ---------- Step 2: rsync files as root ----------
+cd "$CPHOME" || die "cannot cd to ${CPHOME}."
+
+# Primary domain: symlink public_html to the domain name
+if [[ ! -e "$DOMAIN" ]]; then
+    ln -s public_html "$DOMAIN" && chown -h "${CPUSER}:${CPUSER}" "$DOMAIN" || die "could not create symlink."
+fi
+
+# rsync -a as root would overwrite public_html's own owner/mode; remember them
+PH_OWNER="$(stat -c '%U:%G' "$PUBLIC_HTML")"
+PH_MODE="$(stat -c '%a' "$PUBLIC_HTML")"
+
+echo
+echo ">>> Syncing files from source (as root)..."
+rsync -ahv --exclude wp-config.php --delete -e "ssh -p ${SSH_PORT}" \
+    "root@${SRC_IP}:${SRC_PATH}/" "${DOMAIN}/" \
+    || die "rsync failed. Stopping before touching the database."
+
+# ---------- Step 2b: default WordPress .htaccess ----------
+echo
+echo ">>> Writing default WordPress .htaccess..."
+rm -f "${PUBLIC_HTML}/.htaccess"
+cat > "${PUBLIC_HTML}/.htaccess" <<'HTACCESS_EOF'
+# BEGIN WordPress
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+RewriteBase /
+RewriteRule ^index\.php$ - [L]
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule . /index.php [L]
+</IfModule>
+# END WordPress
+HTACCESS_EOF
+chmod 644 "${PUBLIC_HTML}/.htaccess" || die "could not write .htaccess."
+
+# ---------- Step 3: table prefix ----------
+echo
+echo ">>> Setting table_prefix in destination wp-config.php..."
+wp config set table_prefix "$TABLE_PREFIX" --path="$DOMAIN" ${WPFLAGS} \
+    || die "wp config set table_prefix failed."
+
+# ---------- Step 4: ownership ----------
+echo
+echo ">>> Fixing ownership..."
+find "$PUBLIC_HTML" -mindepth 1 -exec chown -h "${CPUSER}:${CPUSER}" {} + || die "chown failed."
+chown "$PH_OWNER" "$PUBLIC_HTML"
+chmod "$PH_MODE" "$PUBLIC_HTML"
+
+# ---------- Step 5: DB reset + import as the cPanel user ----------
+echo
+echo ">>> Resetting and importing database as ${CPUSER}..."
+su -s /bin/bash -l "$CPUSER" -c \
+    "cd '${CPHOME}' && wp db reset --yes --path='${DOMAIN}' && wp db import '${DOMAIN}/${DUMP}' --path='${DOMAIN}'" \
+    || die "database reset/import failed."
+
+echo
+echo "Migration of ${DOMAIN} completed successfully."
